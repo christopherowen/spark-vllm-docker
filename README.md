@@ -8,7 +8,7 @@ This repository contains the Docker configuration and startup scripts to run a m
 This repository is not affiliated with NVIDIA or their subsidiaries. The content is provided as a reference material only, not intended for production use.
 Some of the steps and parameters may be unnecessary, and some may be missing. This is a work in progress. Use at your own risk!
 
-The Dockerfile builds from the main branch of VLLM, so depending on when you run the build process, it may not be in fully funcioning state.
+The Dockerfile builds from the main branch of VLLM, so depending on when you run the build process, it may not be in fully functioning state.
 
 ## 1\. Building the Docker Image
 
