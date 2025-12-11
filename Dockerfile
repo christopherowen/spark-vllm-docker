@@ -80,9 +80,6 @@ RUN python3 use_existing_torch.py && \
 COPY fastsafetensors.patch .
 RUN patch -p1 < fastsafetensors.patch
 
-# TEMPORARY PATCH for broken MiniMax M2 - tracking https://github.com/vllm-project/vllm/issues/30445 and https://github.com/vllm-project/vllm/pull/30389
-RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/30389.diff | git apply
-
 # Final Build
 # Uses --no-build-isolation to respect the pre-installed Torch/FlashInfer
 RUN pip install --no-build-isolation . -v
