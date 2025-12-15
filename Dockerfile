@@ -89,7 +89,7 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     pip install -r python/requirements.txt && \
     mkdir -p /workspace/wheels && \
     pip wheel --no-build-isolation . --wheel-dir=/workspace/wheels -v && \
-    pip wheel python/triton_kernels --no-deps --wheel-dir=/workspace/wheels
+    pip wheel --no-build-isolation  python/triton_kernels --no-deps --wheel-dir=/workspace/wheels
 
 # =========================================================
 # STAGE 3: vLLM Builder (Builds vLLM from Source)
