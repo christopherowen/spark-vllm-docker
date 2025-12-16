@@ -174,6 +174,7 @@ RUN apt update && apt upgrade -y \
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
+    gnuplot-nox \
     && rm -rf /var/lib/apt/lists/*
 
 # Set final working directory
@@ -202,4 +203,4 @@ RUN chmod +x $VLLM_BASE_DIR/run-cluster-node.sh
 
 # Final extra deps
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install ray[default]
+    pip install ray[default] termplotlib
