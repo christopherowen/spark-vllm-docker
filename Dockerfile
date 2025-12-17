@@ -31,6 +31,7 @@ RUN apt update && apt upgrade -y \
     libcudnn9-cuda-13 libcudnn9-dev-cuda-13 \
     python3-dev python3-pip git wget \
     libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
+    libopenmpi3 libopenblas0-pthread libnuma1 \
     ccache \
     && rm -rf /var/lib/apt/lists/*
 
@@ -62,22 +63,79 @@ ENV PIP_CACHE_DIR=/root/.cache/pip
 # Copy Patches
 COPY patches/ /tmp/patches/
 
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+# =========================================================
+# STAGE 2: PyTorch Builder (Builds torch wheel independently)
+# =========================================================
+FROM base AS pytorch-builder
 
-# Install additional dependencies
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install xgrammar fastsafetensors
+ARG PYTORCH_REPO=https://github.com/pytorch/pytorch.git
+ARG PYTORCH_REF=ffcbb7fd6109df6b65e96fe07287255e387f0123
+ARG TORCH_CUDA_ARCH_LIST_DEFAULT="12.1a"
 
-# Install FlashInfer packages
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST_DEFAULT}"
+ENV USE_CCACHE=1
+ENV CCACHE_DIR=/root/.ccache
+
+# Clone/update PyTorch using a persistent repo cache
+RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    set -eux; \
+    cd /repo-cache; \
+    if [ ! -d pytorch ]; then \
+      echo "Cache miss: cloning PyTorch..."; \
+      git clone --recursive "${PYTORCH_REPO}" pytorch; \
+    fi; \
+    cd pytorch; \
+    git fetch --all; \
+    git checkout "${PYTORCH_REF}"; \
+    if [ "${PYTORCH_REF}" = "main" ]; then \
+      git reset --hard origin/main; \
+    fi; \
+    git submodule sync; \
+    git submodule update --init --recursive; \
+    rm -rf /opt/pytorch; \
+    cp -a /repo-cache/pytorch /opt/pytorch
+
+# Build torch wheel (with a wheelhouse cache) and export it like Triton does
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install flashinfer-python --no-deps --index-url https://flashinfer.ai/whl && \
-    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl && \
-    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130 && \
-    pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
+    --mount=type=cache,id=ccache,target=/root/.ccache \
+    --mount=type=cache,id=torch-wheelhouse,target=/wheelhouse \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential ninja-build cmake ccache clang lld patchelf pkg-config \
+      libssl-dev libffi-dev libopenblas-dev libomp-dev libopenmpi-dev \
+      python3 python3-dev python3-pip python3-venv; \
+    rm -rf /var/lib/apt/lists/*; \
+    \
+    cd /opt/pytorch; \
+    patch="pytorch-sm121.patch"; \
+    echo "==> Applying $patch"; \
+    (patch --dry-run -p1 < "/tmp/patches/$patch" && patch -p1 < "/tmp/patches/$patch"); \
+    \
+    WHEEL_CACHE_DIR="/wheelhouse/pytorch/${PYTORCH_REF}/sm121a"; \
+    mkdir -p "$WHEEL_CACHE_DIR" /workspace/wheels; \
+    \
+    WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/torch-*.whl 2>/dev/null | head -n1 || true)"; \
+    if [ -z "$WHEEL" ]; then \
+      echo "==> Wheel cache miss: building torch wheel"; \
+      python3 -m venv /opt/pytorch/.venv-build; \
+      . /opt/pytorch/.venv-build/bin/activate; \
+      pip install -U pip setuptools wheel; \
+      pip install -r requirements.txt; \
+      export USE_CUDA=1 USE_DISTRIBUTED=1 BUILD_TEST=0 USE_KINETO=0 USE_ITT=0 USE_MKLDNN=0; \
+      python setup.py bdist_wheel; \
+      cp dist/torch-*.whl "$WHEEL_CACHE_DIR"/; \
+      deactivate; \
+      rm -rf /opt/pytorch/.venv-build; \
+      WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/torch-*.whl | head -n1)"; \
+    else \
+      echo "==> Wheel cache hit: $WHEEL"; \
+    fi; \
+    cp -a "$WHEEL" /workspace/wheels/
 
 # =========================================================
-# STAGE 2: Triton Builder (Compiles Triton independently)
+# STAGE 3: Triton Builder (Compiles Triton independently)
 # =========================================================
 FROM base AS triton-builder
 
@@ -105,7 +163,7 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     pip wheel --no-build-isolation  python/triton_kernels --no-deps --wheel-dir=/workspace/wheels
 
 # =========================================================
-# STAGE 3: vLLM Builder (Builds vLLM from Source)
+# STAGE 4: vLLM Builder (Builds vLLM from Source)
 # =========================================================
 FROM base AS builder
 
@@ -142,6 +200,24 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
+
+# Install custom PyTorch, Triton before vLLM tooling
+COPY --from=pytorch-builder /workspace/wheels/. /workspace/wheels/
+COPY --from=triton-builder  /workspace/wheels/. /workspace/wheels/
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    pip install /workspace/wheels/*.whl && rm -rf /workspace/wheels
+
+# Install additional dependencies
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    pip install xgrammar fastsafetensors
+
+# Install FlashInfer packages
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    pip install flashinfer-python --no-deps --index-url https://flashinfer.ai/whl && \
+    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl && \
+    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130 && \
+    pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
+
 # Prepare build requirements
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     python3 use_existing_torch.py && \
@@ -164,11 +240,6 @@ RUN set -eux; \
     cd "$VLLM_BASE_DIR/vllm"; \
     (patch --dry-run -p1 < "/tmp/patches/$patch" && patch -p1 < "/tmp/patches/$patch")
 
-# Install custom Triton from triton-builder (before vLLM below)
-COPY --from=triton-builder /workspace/wheels /workspace/wheels
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install /workspace/wheels/*.whl
-
 # vLLM Compilation
 # We mount the ccache directory here. Ideally, map this to a host volume for persistence 
 # across totally separate `docker build` invocations.
@@ -177,7 +248,7 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     pip install --no-build-isolation . -v
 
 # =========================================================
-# STAGE 4: Runner (Transfers only necessary artifacts)
+# STAGE 5: Runner (Transfers only necessary artifacts)
 # =========================================================
 FROM nvidia/cuda:13.0.2-devel-ubuntu24.04 AS runner
 
