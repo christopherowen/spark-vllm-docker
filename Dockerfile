@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
-ARG BUILD_JOBS=16
+ARG BUILD_JOBS=15
 
 # =========================================================
 # STAGE 1: Base Image (Installs Dependencies)
@@ -49,10 +49,6 @@ WORKDIR $VLLM_BASE_DIR
 ENV TORCH_CUDA_ARCH_LIST=12.1a
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
-# --- CACHE BUSTER ---
-# Change this argument to force a re-download of PyTorch/FlashInfer
-ARG CACHEBUST_DEPS=1
-
 # 3. Install Python Dependencies with Cache Mounts
 # Using --mount=type=cache ensures that even if this layer invalidates, 
 # pip reuses previously downloaded wheels.
@@ -64,7 +60,7 @@ ENV PIP_CACHE_DIR=/root/.cache/pip
 COPY patches/ /tmp/patches/
 
 # =========================================================
-# STAGE 2: PyTorch Builder (Builds torch wheel independently)
+# STAGE 2: PyTorch Builder (Builds wheel independently)
 # =========================================================
 FROM base AS pytorch-builder
 
@@ -135,7 +131,7 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     cp -a "$WHEEL" /workspace/wheels/
 
 # =========================================================
-# STAGE 3: Triton Builder (Compiles Triton independently)
+# STAGE 3: Triton Builder (Builds wheel independently)
 # =========================================================
 FROM base AS triton-builder
 
@@ -163,14 +159,9 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     pip wheel --no-build-isolation  python/triton_kernels --no-deps --wheel-dir=/workspace/wheels
 
 # =========================================================
-# STAGE 4: vLLM Builder (Builds vLLM from Source)
+# STAGE 4: vLLM Builder (Builds vLLM and dependancies wheels)
 # =========================================================
 FROM base AS vllm-builder
-
-# --- VLLM SOURCE CACHE BUSTER ---
-# Change THIS argument to force a fresh git clone and rebuild of vLLM
-# without re-installing the dependencies above.
-ARG CACHEBUST_VLLM=1
 
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
@@ -205,10 +196,6 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 
 # Install additional dependencies
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install xgrammar fastsafetensors
-
-# Install FlashInfer packages
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install flashinfer-python --no-deps --index-url https://flashinfer.ai/whl && \
     pip install flashinfer-cubin --index-url https://flashinfer.ai/whl && \
     pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130 && \
@@ -218,10 +205,11 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
+    sed -i -E '/^(torch|torchaudio|torchvision)==/d' requirements/cuda.txt; \
+    sed -i -E '/^xgrammar([<=> ].*)?$/d' requirements/common.txt; \
     pip install -r requirements/build.txt
 
 # Apply Patches
-
 # Performance boost for spark: https://github.com/vllm-project/vllm/pull/28099
 RUN set -eux; \
     patch="vllm-pr-28099.diff"; \
@@ -237,11 +225,19 @@ RUN set -eux; \
     (patch --dry-run -p1 < "/tmp/patches/$patch" && patch -p1 < "/tmp/patches/$patch")
 
 # vLLM Compilation
-# We mount the ccache directory here. Ideally, map this to a host volume for persistence 
-# across totally separate `docker build` invocations.
+# Build vLLM and deps wheels
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install --no-build-isolation . -v
+    set -eux; \
+    mkdir -p /workspace/wheels && \
+    pip wheel --no-build-isolation --no-deps . -w /workspace/wheels -v && \
+    pip wheel -r requirements/cuda.txt -w /workspace/wheels
+
+#xgrammar pulls in torch.  nuke it.
+RUN set -eux; \
+    rm -f /workspace/wheels/torch-*.whl \
+          /workspace/wheels/torchaudio-*.whl \
+          /workspace/wheels/torchvision-*.whl
 
 # =========================================================
 # STAGE 5: Runner (Transfers only necessary artifacts)
@@ -285,11 +281,24 @@ RUN --mount=type=cache,id=tiktoken-encodings,target=/root/.cache/tiktoken_encodi
     mkdir -p "$VLLM_BASE_DIR/tiktoken_encodings"; \
     cp -a /root/.cache/tiktoken_encodings/. "$VLLM_BASE_DIR/tiktoken_encodings/"
 
-# Copy artifacts from Builder Stage
-# We copy the python packages and executables
-# No need to copy source code, as it's already in the site-packages
-COPY --from=vllm-builder /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
-COPY --from=vllm-builder /usr/local/bin /usr/local/bin
+# Install additional dependencies
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    pip install xgrammar fastsafetensors && \
+    pip install flashinfer-python --no-deps --index-url https://flashinfer.ai/whl && \
+    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl && \
+    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130 && \
+    pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
+
+# Install from wheels
+COPY --from=pytorch-builder /workspace/wheels/. /workspace/wheels/
+COPY --from=triton-builder /workspace/wheels/. /workspace/wheels/
+COPY --from=vllm-builder  /workspace/wheels/. /workspace/wheels/
+
+# Install the built wheels
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    set -eux; \
+    pip install /workspace/wheels/*.whl; \
+    rm -rf /workspace/wheels
 
 # Setup Env for Runtime
 ENV TORCH_CUDA_ARCH_LIST=12.1a
