@@ -165,7 +165,7 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
 # =========================================================
 # STAGE 4: vLLM Builder (Builds vLLM from Source)
 # =========================================================
-FROM base AS builder
+FROM base AS vllm-builder
 
 # --- VLLM SOURCE CACHE BUSTER ---
 # Change THIS argument to force a fresh git clone and rebuild of vLLM
@@ -178,25 +178,21 @@ ARG VLLM_REF=main
 # 4. Smart Git Clone (Fetch changes instead of full re-clone)
 # We mount a cache at /repo-cache. This directory persists on your host machine.
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
-    # 1. Go into the persistent cache directory
-    cd /repo-cache && \
-    # 2. Logic: Clone if missing, otherwise Fetch & Reset
+    set -eux; \
+    cd /repo-cache; \
     if [ ! -d "vllm" ]; then \
         echo "Cache miss: Cloning vLLM from scratch..." && \
-        git clone --recursive https://github.com/vllm-project/vllm.git; \
-    else \
-        echo "Cache hit: Fetching updates..." && \
-        cd vllm && \
-        git fetch --all && \
-        git checkout ${VLLM_REF} && \
-        if [ "${VLLM_REF}" = "main" ]; then \
-            git reset --hard origin/main; \
-        fi && \
-        git submodule update --init --recursive; \
-    fi && \
-    # 3. Copy the updated code from the cache to the actual container workspace
-    # We use 'cp -a' to preserve permissions
-    cp -a /repo-cache/vllm $VLLM_BASE_DIR/
+        git clone --recursive https://github.com/vllm-project/vllm.git vllm; \
+    fi; \
+    cd vllm; \
+    git fetch --all; \
+    git checkout ${VLLM_REF}; \
+    if [ "${VLLM_REF}" = "main" ]; then \
+        git reset --hard origin/main; \
+    fi; \
+    git submodule update --init --recursive; \
+    rm -rf "${VLLM_BASE_DIR}/vllm"; \
+    cp -a /repo-cache/vllm "${VLLM_BASE_DIR}/"
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
@@ -292,8 +288,8 @@ RUN --mount=type=cache,id=tiktoken-encodings,target=/root/.cache/tiktoken_encodi
 # Copy artifacts from Builder Stage
 # We copy the python packages and executables
 # No need to copy source code, as it's already in the site-packages
-COPY --from=builder /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=vllm-builder /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
+COPY --from=vllm-builder /usr/local/bin /usr/local/bin
 
 # Setup Env for Runtime
 ENV TORCH_CUDA_ARCH_LIST=12.1a
