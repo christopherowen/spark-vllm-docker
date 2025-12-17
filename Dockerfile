@@ -151,6 +151,14 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install -r requirements/build.txt
 
 # Apply Patches
+
+# Performance boost for spark: https://github.com/vllm-project/vllm/pull/28099
+RUN set -eux; \
+    patch="vllm-pr-28099.diff"; \
+    echo "==> Applying $patch"; \
+    cd "$VLLM_BASE_DIR/vllm"; \
+    (patch --dry-run -p1 < "/tmp/patches/$patch" && patch -p1 < "/tmp/patches/$patch")
+
 # fastsafetensors loading in cluster setup - tracking https://github.com/foundation-model-stack/fastsafetensors/issues/36
 RUN set -eux; \
     patch="fastsafetensors-issue-36.patch"; \
