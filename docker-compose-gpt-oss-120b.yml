@@ -6,7 +6,8 @@ services:
       - "8000:8000"
 
     environment:
-      VLLM_USE_FLASHINFER_MXFP4_MOE: "1"
+      VLLM_USE_FLASHINFER_MOE_FP4: "1"
+      VLLM_FLASHINFER_MOE_BACKEND: "throughput"
 
     runtime: nvidia
     ipc: host
@@ -19,6 +20,7 @@ services:
       - ./.cache/vllm:/root/.cache/vllm
       - ./.cache/torch:/root/.cache/torch
       - ./.cache/triton:/root/.cache/triton
+      - ./.cache/flashinfer:/root/.cache/flashinfer
       - ./chat_templates/gpt-oss-120b.jinja:/workspace/chat_templates/gpt-oss-120b.jinja:ro
       - ./bench:/bench
 

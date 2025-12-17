@@ -136,15 +136,37 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     rm -rf "$PYTORCH_VENV"
 
 # =========================================================
-# STAGE 3: Triton Builder (Builds wheel independently)
+# STAGE 3: Triton Builder (Builds wheel independently) - Shaun-style (LLVM21 + pinned commit)
 # =========================================================
 FROM base AS triton-builder
 
 ARG TRITON_REPO=https://github.com/triton-lang/triton.git
-# Set to v3.5.1 tag by default (pass from CLI to change)
-ARG TRITON_REF=v3.5.1
+# Shaun pins a newer commit (override from CLI if you want)
+ARG TRITON_REF=84214b65456249c92d3fdbe461ae0065f40e79e9
+ARG LLVM_VERSION=21
 
-# Clone/update Triton using the same persistent repo cache approach
+# Install LLVM 21 toolchain (apt.llvm.org) + clang/lld for Triton
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gnupg ca-certificates; \
+    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-${LLVM_VERSION} main" \
+      > /etc/apt/sources.list.d/llvm.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      llvm-${LLVM_VERSION}-dev mlir-${LLVM_VERSION}-tools libmlir-${LLVM_VERSION}-dev \
+      clang-${LLVM_VERSION} lld-${LLVM_VERSION}; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV LLVM_DIR=/usr/lib/llvm-${LLVM_VERSION}/lib/cmake/llvm
+ENV PATH=/usr/lib/llvm-${LLVM_VERSION}/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/lib/llvm-${LLVM_VERSION}/lib:${LD_LIBRARY_PATH}
+ENV TRITON_BUILD_WITH_CLANG_LLD=true
+ENV TRITON_BUILD_WITH_CCACHE=true
+
+# Clone/update Triton using the persistent repo cache approach
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     set -eux; \
     cd /repo-cache; \
@@ -153,7 +175,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
       git clone --recursive "${TRITON_REPO}" triton; \
     fi; \
     cd triton; \
-    git fetch --all --tags; \
+    git fetch --all; \
     git checkout "${TRITON_REF}"; \
     if [ "${TRITON_REF}" = "main" ]; then \
       git reset --hard origin/main; \
@@ -177,25 +199,28 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     --mount=type=cache,id=triton-wheelhouse,target=/wheelhouse \
     set -eux; \
+    pip install pybind11; \
     pip install -r python/requirements.txt; \
     \
-    # Key the wheel cache by ref + environment (good enough given fixed base image)
-    WHEEL_CACHE_DIR="/wheelhouse/triton/${TRITON_REF}/cp312/aarch64/cu130"; \
+    WHEEL_CACHE_DIR="/wheelhouse/triton/${TRITON_REF}/llvm${LLVM_VERSION}/cp312/aarch64/cu130"; \
     mkdir -p "$WHEEL_CACHE_DIR" /workspace/wheels; \
     \
     TRITON_WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/triton-*.whl 2>/dev/null | head -n1 || true)"; \
-    KERNELS_WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/triton_kernels-*.whl 2>/dev/null | head -n1 || true)"; \
     \
-    if [ -z "$TRITON_WHEEL" ] || [ -z "$KERNELS_WHEEL" ]; then \
+    if [ -z "$TRITON_WHEEL" ]; then \
       echo "==> Wheel cache miss: building Triton wheels"; \
       pip wheel --no-build-isolation . --wheel-dir="$WHEEL_CACHE_DIR" -v; \
-      pip wheel --no-build-isolation python/triton_kernels --no-deps --wheel-dir="$WHEEL_CACHE_DIR"; \
     else \
-      echo "==> Wheel cache hit: $TRITON_WHEEL and $KERNELS_WHEEL"; \
+      echo "==> Wheel cache hit: $TRITON_WHEEL"; \
     fi; \
     \
-    cp -a "$WHEEL_CACHE_DIR"/*.whl /workspace/wheels/; \
+    # IMPORTANT: do NOT export Triton's triton_kernels wheel (it shadows vLLM’s expected kernel matmul_ogs)
+    rm -f "$WHEEL_CACHE_DIR"/triton_kernels-*.whl; \
+    \
+    # Export only Triton
+    cp -a "$WHEEL_CACHE_DIR"/triton-*.whl /workspace/wheels/; \
     rm -rf "$TRITON_VENV"
+
 
 # =========================================================
 # STAGE 4: FlashInfer Builder (Nightly wheels; force JIT for sm_121a)
@@ -294,7 +319,7 @@ COPY --from=triton-builder  /workspace/wheels/. /workspace/wheels/
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     set -eux; \
     pip install /workspace/wheels/torch-*.whl; \
-    pip install /workspace/wheels/triton-*.whl /workspace/wheels/triton_kernels-*.whl || true; \
+    pip install /workspace/wheels/triton-*.whl; \
     rm -rf /workspace/wheels
 
 # Apply Shaun's patch (adds sm_121 handling)
@@ -334,8 +359,8 @@ RUN set -eux; \
 # =========================================================
 FROM base AS vllm-builder
 
-# Git reference (branch, tag, or SHA) to checkout
-ARG VLLM_REF=main
+# Match Shaun
+ARG VLLM_REF=ae2e503dda693b6b7ab9052ec61e012a3c730f2f
 
 # 4. Smart Git Clone (Fetch changes instead of full re-clone)
 # We mount a cache at /repo-cache. This directory persists on your host machine.
@@ -390,6 +415,7 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 
 # Apply Patches
 # Performance boost for spark: https://github.com/vllm-project/vllm/pull/28099
+# does not change TPS for gpt-oss-120b
 RUN set -eux; \
     patch="vllm-pr-28099.diff"; \
     echo "==> Applying $patch"; \
