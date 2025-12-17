@@ -29,7 +29,7 @@ RUN apt update && apt upgrade -y \
     && apt install -y --allow-change-held-packages --no-install-recommends \
     curl vim cmake build-essential ninja-build \
     libcudnn9-cuda-13 libcudnn9-dev-cuda-13 \
-    python3-dev python3-pip git wget \
+    python3 python3-dev python3-pip python3-venv git wget \
     libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
     libopenmpi3 libopenblas0-pthread libnuma1 \
     ccache \
@@ -88,8 +88,17 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     fi; \
     git submodule sync; \
     git submodule update --init --recursive; \
-    rm -rf /opt/pytorch; \
-    cp -a /repo-cache/pytorch /opt/pytorch
+    rm -rf "${VLLM_BASE_DIR}/pytorch"; \
+    cp -a /repo-cache/pytorch "${VLLM_BASE_DIR}/pytorch"
+
+WORKDIR $VLLM_BASE_DIR/pytorch
+ENV PYTORCH_VENV=${VLLM_BASE_DIR}/pytorch/.venv-build
+ENV PATH=${PYTORCH_VENV}/bin:$PATH
+
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    set -eux; \
+    python3 -m venv "$PYTORCH_VENV"; \
+    pip install -U pip setuptools wheel
 
 # Build torch wheel (with a wheelhouse cache) and export it like Triton does
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
@@ -101,62 +110,92 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     apt-get install -y --no-install-recommends \
       build-essential ninja-build cmake ccache clang lld patchelf pkg-config \
       libssl-dev libffi-dev libopenblas-dev libomp-dev libopenmpi-dev \
-      python3 python3-dev python3-pip python3-venv; \
-    rm -rf /var/lib/apt/lists/*; \
+    && rm -rf /var/lib/apt/lists/*; \
     \
-    cd /opt/pytorch; \
     patch="pytorch-sm121.patch"; \
     echo "==> Applying $patch"; \
     (patch --dry-run -p1 < "/tmp/patches/$patch" && patch -p1 < "/tmp/patches/$patch"); \
     \
-    WHEEL_CACHE_DIR="/wheelhouse/pytorch/${PYTORCH_REF}/sm121a"; \
+    WHEEL_CACHE_DIR="/wheelhouse/pytorch/${PYTORCH_REF}/sm121a/aarch64/cu130"; \
     mkdir -p "$WHEEL_CACHE_DIR" /workspace/wheels; \
     \
-    WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/torch-*.whl 2>/dev/null | head -n1 || true)"; \
-    if [ -z "$WHEEL" ]; then \
+    PYTORCH_WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/torch-*.whl 2>/dev/null | head -n1 || true)"; \
+    if [ -z "$PYTORCH_WHEEL" ]; then \
       echo "==> Wheel cache miss: building torch wheel"; \
-      python3 -m venv /opt/pytorch/.venv-build; \
-      . /opt/pytorch/.venv-build/bin/activate; \
-      pip install -U pip setuptools wheel; \
+      rm -f "$WHEEL_CACHE_DIR"/torch-*.whl; \
       pip install -r requirements.txt; \
       export USE_CUDA=1 USE_DISTRIBUTED=1 BUILD_TEST=0 USE_KINETO=0 USE_ITT=0 USE_MKLDNN=0; \
       python setup.py bdist_wheel; \
       cp dist/torch-*.whl "$WHEEL_CACHE_DIR"/; \
-      deactivate; \
-      rm -rf /opt/pytorch/.venv-build; \
-      WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/torch-*.whl | head -n1)"; \
+      PYTORCH_WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/torch-*.whl | head -n1)"; \
     else \
-      echo "==> Wheel cache hit: $WHEEL"; \
+      echo "==> Wheel cache hit: $PYTORCH_WHEEL"; \
     fi; \
-    cp -a "$WHEEL" /workspace/wheels/
+    \
+    cp -a "$WHEEL_CACHE_DIR"/*.whl /workspace/wheels/; \
+    rm -rf "$PYTORCH_VENV"
 
 # =========================================================
 # STAGE 3: Triton Builder (Builds wheel independently)
 # =========================================================
 FROM base AS triton-builder
 
-WORKDIR $VLLM_BASE_DIR
-
-# Initial Triton repo clone (cached forever)
-RUN git clone https://github.com/triton-lang/triton.git
-
-# We expect TRITON_REF to be passed from the command line to break the cache
-# Set to v3.5.1 tag by default
+ARG TRITON_REPO=https://github.com/triton-lang/triton.git
+# Set to v3.5.1 tag by default (pass from CLI to change)
 ARG TRITON_REF=v3.5.1
 
-WORKDIR $VLLM_BASE_DIR/triton
+# Clone/update Triton using the same persistent repo cache approach
+RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    set -eux; \
+    cd /repo-cache; \
+    if [ ! -d triton ]; then \
+      echo "Cache miss: cloning Triton..."; \
+      git clone --recursive "${TRITON_REPO}" triton; \
+    fi; \
+    cd triton; \
+    git fetch --all --tags; \
+    git checkout "${TRITON_REF}"; \
+    if [ "${TRITON_REF}" = "main" ]; then \
+      git reset --hard origin/main; \
+    fi; \
+    git submodule sync; \
+    git submodule update --init --recursive; \
+    rm -rf "${VLLM_BASE_DIR}/triton"; \
+    cp -a /repo-cache/triton "${VLLM_BASE_DIR}/triton"
 
-# This only runs if TRITON_REF differs from the last build
+WORKDIR $VLLM_BASE_DIR/triton
+ENV TRITON_VENV=${VLLM_BASE_DIR}/triton/.venv-build
+ENV PATH=${TRITON_VENV}/bin:$PATH
+
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    set -eux; \
+    python3 -m venv "$TRITON_VENV"; \
+    pip install -U pip setuptools wheel
+
+# Build (or reuse) Triton wheels from a persistent wheelhouse cache
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    git fetch origin && \
-    git checkout ${TRITON_REF} && \
-    git submodule sync && \
-    git submodule update --init --recursive && \
-    pip install -r python/requirements.txt && \
-    mkdir -p /workspace/wheels && \
-    pip wheel --no-build-isolation . --wheel-dir=/workspace/wheels -v && \
-    pip wheel --no-build-isolation  python/triton_kernels --no-deps --wheel-dir=/workspace/wheels
+    --mount=type=cache,id=triton-wheelhouse,target=/wheelhouse \
+    set -eux; \
+    pip install -r python/requirements.txt; \
+    \
+    # Key the wheel cache by ref + environment (good enough given fixed base image)
+    WHEEL_CACHE_DIR="/wheelhouse/triton/${TRITON_REF}/cp312/aarch64/cu130"; \
+    mkdir -p "$WHEEL_CACHE_DIR" /workspace/wheels; \
+    \
+    TRITON_WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/triton-*.whl 2>/dev/null | head -n1 || true)"; \
+    KERNELS_WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/triton_kernels-*.whl 2>/dev/null | head -n1 || true)"; \
+    \
+    if [ -z "$TRITON_WHEEL" ] || [ -z "$KERNELS_WHEEL" ]; then \
+      echo "==> Wheel cache miss: building Triton wheels"; \
+      pip wheel --no-build-isolation . --wheel-dir="$WHEEL_CACHE_DIR" -v; \
+      pip wheel --no-build-isolation python/triton_kernels --no-deps --wheel-dir="$WHEEL_CACHE_DIR"; \
+    else \
+      echo "==> Wheel cache hit: $TRITON_WHEEL and $KERNELS_WHEEL"; \
+    fi; \
+    \
+    cp -a "$WHEEL_CACHE_DIR"/*.whl /workspace/wheels/; \
+    rm -rf "$TRITON_VENV"
 
 # =========================================================
 # STAGE 4: vLLM Builder (Builds vLLM and dependancies wheels)
@@ -186,7 +225,13 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cp -a /repo-cache/vllm "${VLLM_BASE_DIR}/"
 
 WORKDIR $VLLM_BASE_DIR/vllm
+ENV VLLM_VENV=${VLLM_BASE_DIR}/vllm/.venv-build
+ENV PATH=${VLLM_VENV}/bin:$PATH
 
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    set -eux; \
+    python3 -m venv "$VLLM_VENV"; \
+    pip install -U pip setuptools wheel
 
 # Install custom PyTorch, Triton before vLLM tooling
 COPY --from=pytorch-builder /workspace/wheels/. /workspace/wheels/
@@ -202,11 +247,13 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
 
 # Prepare build requirements
+# prefer our flashinfer and pytorch
+# xgrammar pulls in pytorch 2.9.1, so install it manually in the runner
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
-    sed -i -E '/^(torch|torchaudio|torchvision)==/d' requirements/cuda.txt; \
-    sed -i -E '/^xgrammar([<=> ].*)?$/d' requirements/common.txt; \
+    sed -i -E '/^(torch|torchaudio|torchvision)==/d' requirements/cuda.txt && \
+    sed -i -E '/^xgrammar([<=> ].*)?$/d' requirements/common.txt && \
     pip install -r requirements/build.txt
 
 # Apply Patches
@@ -231,7 +278,8 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     set -eux; \
     mkdir -p /workspace/wheels && \
     pip wheel --no-build-isolation --no-deps . -w /workspace/wheels -v && \
-    pip wheel -r requirements/cuda.txt -w /workspace/wheels
+    pip wheel -r requirements/cuda.txt -w /workspace/wheels; \
+    rm -rf "$VLLM_VENV"
 
 #xgrammar pulls in torch.  nuke it.
 RUN set -eux; \
@@ -281,14 +329,6 @@ RUN --mount=type=cache,id=tiktoken-encodings,target=/root/.cache/tiktoken_encodi
     mkdir -p "$VLLM_BASE_DIR/tiktoken_encodings"; \
     cp -a /root/.cache/tiktoken_encodings/. "$VLLM_BASE_DIR/tiktoken_encodings/"
 
-# Install additional dependencies
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install xgrammar fastsafetensors && \
-    pip install flashinfer-python --no-deps --index-url https://flashinfer.ai/whl && \
-    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl && \
-    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130 && \
-    pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
-
 # Install from wheels
 COPY --from=pytorch-builder /workspace/wheels/. /workspace/wheels/
 COPY --from=triton-builder /workspace/wheels/. /workspace/wheels/
@@ -299,6 +339,14 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     set -eux; \
     pip install /workspace/wheels/*.whl; \
     rm -rf /workspace/wheels
+
+# Install flashinfer and dependencies
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    pip install --no-deps xgrammar fastsafetensors  && \
+    pip install flashinfer-python --no-deps --index-url https://flashinfer.ai/whl && \
+    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl && \
+    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130 && \
+    pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
 
 # Setup Env for Runtime
 ENV TORCH_CUDA_ARCH_LIST=12.1a
