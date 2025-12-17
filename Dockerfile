@@ -29,7 +29,7 @@ RUN apt update && apt upgrade -y \
     && apt install -y --allow-change-held-packages --no-install-recommends \
     curl vim cmake build-essential ninja-build \
     libcudnn9-cuda-13 libcudnn9-dev-cuda-13 \
-    python3 python3-dev python3-pip python3-venv git wget \
+    python3 python3-dev python3-pip python3-venv python3-packaging git wget \
     libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
     libopenmpi3 libopenblas0-pthread libnuma1 \
     ccache \
@@ -339,7 +339,7 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     if [ -z "$FLASH_ATTN_WHEEL" ]; then \
       echo "==> Wheel cache miss: building FlashAttention wheel"; \
       rm -f "$WHEEL_CACHE_DIR"/flash_attn-*.whl; \
-      FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS}" pip wheel --nodeps --no-build-isolation . -w "$WHEEL_CACHE_DIR" -v; \
+      FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS}" pip wheel --no-deps --no-build-isolation . -w "$WHEEL_CACHE_DIR" -v; \
       FLASH_ATTN_WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/flash_attn-*.whl | head -n1)"; \
     else \
       echo "==> Wheel cache hit: $FLASH_ATTN_WHEEL"; \
