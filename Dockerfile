@@ -1,9 +1,18 @@
 # syntax=docker/dockerfile:1.6
 
+ARG BUILD_JOBS=16
+
 # =========================================================
 # STAGE 1: Base Image (Installs Dependencies)
 # =========================================================
 FROM nvidia/cuda:13.0.2-devel-ubuntu24.04 AS base
+
+# Try to keep the system from trashing during builds
+ARG BUILD_JOBS
+ENV MAX_JOBS=${BUILD_JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
+ENV NINJAFLAGS="-j${BUILD_JOBS}"
+ENV MAKEFLAGS="-j${BUILD_JOBS}"
 
 # Set non-interactive frontend to prevent apt prompts
 ENV DEBIAN_FRONTEND=noninteractive
