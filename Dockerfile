@@ -146,8 +146,6 @@ WORKDIR $VLLM_BASE_DIR/vllm
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
-    sed -i '/^triton\b/d' requirements/test.txt && \
-    sed -i '/^fastsafetensors\b/d' requirements/test.txt && \
     pip install -r requirements/build.txt
 
 # Apply Patches
