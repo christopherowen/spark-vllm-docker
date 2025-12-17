@@ -20,8 +20,10 @@ MAX_CONCURRENCY="2"
 DATASET_PATH="/bench/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 # find the container id by name or default to vllm
+
+COMPOSE_CONFIG="$ROOT_DIR/docker-compose-gpt-oss-120b.yml"
 COMPOSE_SERVICE="vllm"
-CONTAINER_ID="$(docker compose ps -q vllm 2>/dev/null || true)"
+CONTAINER_ID="$(docker compose -f $COMPOSE_CONFIG ps -q vllm 2>/dev/null || true)"
 CONTAINER_ID="${CONTAINER_ID:-$COMPOSE_SERVICE}"
 
 # ---- Warmup ----
