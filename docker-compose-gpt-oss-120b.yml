@@ -5,6 +5,9 @@ services:
     ports:
       - "8000:8000"
 
+    environment:
+      VLLM_USE_FLASHINFER_MXFP4_MOE: "1"
+
     runtime: nvidia
     ipc: host
     ulimits:

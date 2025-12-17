@@ -1,0 +1,25 @@
+--- a/setup.py
++++ b/setup.py
+@@ -66,7 +66,7 @@ FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE
+ 
+ @functools.lru_cache(maxsize=None)
+ def cuda_archs() -> str:
+-    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
++    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120;121").split(";")
+ 
+ 
+ def get_platform():
+@@ -125,6 +125,13 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
+             else:
+                 cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
+ 
++        if "121" in archs:
++            # sm_121 is supported in CUDA 12.8/12.9+ toolkits
++            if bare_metal_version >= Version("12.9"):
++                cc_flag += ["-gencode", "arch=compute_121f,code=sm_121"]
++            else:
++                cc_flag += ["-gencode", "arch=compute_121,code=sm_121"]
++
+         # Thor rename: 12.9 uses sm_101; 13.0+ uses sm_110
+         if "110" in archs:
+             if bare_metal_version >= Version("13.0"):

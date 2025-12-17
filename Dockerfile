@@ -252,9 +252,85 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     cp -a "$WHEEL_CACHE_DIR"/*.whl /workspace/wheels/; \
     rm -rf "$FLASHINFER_VENV"
 
+# =========================================================
+# STAGE 5: FlashAttention Builder (Builds wheel for sm_121a)
+# =========================================================
+FROM base AS flash-attn-builder
+
+ARG FLASH_ATTN_REPO=https://github.com/Dao-AILab/flash-attention.git
+# Match Shaun
+ARG FLASH_ATTN_REF=bc0e4ac01484ffb61ddc694724826bec4d9cf1c2
+ARG FLASH_ATTN_CUDA_ARCHS=121a
+
+WORKDIR $VLLM_BASE_DIR/flash-attn
+ENV FLASH_ATTN_VENV=${VLLM_BASE_DIR}/flash-attn/.venv-build
+ENV PATH=${FLASH_ATTN_VENV}/bin:$PATH
+
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    set -eux; \
+    python3 -m venv "$FLASH_ATTN_VENV"; \
+    pip install -U pip setuptools wheel
+
+# Get source (cached)
+RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    set -eux; \
+    cd /repo-cache; \
+    if [ ! -d flash-attention ]; then \
+      echo "Cache miss: cloning FlashAttention..."; \
+      git clone --recursive "${FLASH_ATTN_REPO}" flash-attention; \
+    fi; \
+    cd flash-attention; \
+    git fetch --all; \
+    git checkout "${FLASH_ATTN_REF}"; \
+    git submodule update --init --recursive; \
+    rm -rf "${VLLM_BASE_DIR}/flash-attn"; \
+    cp -a /repo-cache/flash-attention "${VLLM_BASE_DIR}/flash-attn"
+
+WORKDIR $VLLM_BASE_DIR/flash-attn
+
+# Install your built torch + triton first (FlashAttention builds against torch)
+COPY --from=pytorch-builder /workspace/wheels/. /workspace/wheels/
+COPY --from=triton-builder  /workspace/wheels/. /workspace/wheels/
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    set -eux; \
+    pip install /workspace/wheels/torch-*.whl; \
+    pip install /workspace/wheels/triton-*.whl /workspace/wheels/triton_kernels-*.whl || true; \
+    rm -rf /workspace/wheels
+
+# Apply Shaun's patch (adds sm_121 handling)
+RUN set -eux; \
+    patch="flash-attn-sm121.patch"; \
+    echo "==> Applying $patch"; \
+    (patch --dry-run -p1 < "/tmp/patches/$patch" && patch -p1 < "/tmp/patches/$patch")
+
+# Build (or reuse) wheel from persistent wheelhouse cache
+RUN --mount=type=cache,id=ccache,target=/root/.ccache \
+    --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    --mount=type=cache,id=flash-attn-wheelhouse,target=/wheelhouse \
+    set -eux; \
+    WHEEL_CACHE_DIR="/wheelhouse/flash-attn/${FLASH_ATTN_REF}/cp312/aarch64/cu130"; \
+    mkdir -p "$WHEEL_CACHE_DIR" /workspace/wheels; \
+    FLASH_ATTN_WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/flash_attn-*.whl 2>/dev/null | head -n1 || true)"; \
+    if [ -z "$FLASH_ATTN_WHEEL" ]; then \
+      echo "==> Wheel cache miss: building FlashAttention wheel"; \
+      rm -f "$WHEEL_CACHE_DIR"/flash_attn-*.whl; \
+      FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS}" pip wheel --nodeps --no-build-isolation . -w "$WHEEL_CACHE_DIR" -v; \
+      FLASH_ATTN_WHEEL="$(ls -1 "$WHEEL_CACHE_DIR"/flash_attn-*.whl | head -n1)"; \
+    else \
+      echo "==> Wheel cache hit: $FLASH_ATTN_WHEEL"; \
+    fi; \
+    cp -a "$WHEEL_CACHE_DIR"/*.whl /workspace/wheels/; \
+    rm -rf "$FLASH_ATTN_VENV"
+
+#flash-attn pulls in torch.  nuke it.
+RUN set -eux; \
+    rm -f /workspace/wheels/torch-*.whl \
+          /workspace/wheels/torchaudio-*.whl \
+          /workspace/wheels/torchvision-*.whl
+
 
 # =========================================================
-# STAGE 5: vLLM Builder (Builds vLLM and dependancies wheels)
+# STAGE 6: vLLM Builder (Builds vLLM and dependancies wheels)
 # =========================================================
 FROM base AS vllm-builder
 
@@ -293,6 +369,7 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 COPY --from=pytorch-builder /workspace/wheels/. /workspace/wheels/
 COPY --from=triton-builder  /workspace/wheels/. /workspace/wheels/
 COPY --from=flashinfer-builder /workspace/wheels/. /workspace/wheels/
+COPY --from=flash-attn-builder  /workspace/wheels/. /workspace/wheels/
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install /workspace/wheels/*.whl && rm -rf /workspace/wheels
 
@@ -301,11 +378,12 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
 
 # Prepare build requirements
-# prefer our flashinfer and pytorch
+# prefer our flashinfer, flash-attn, and pytorch
 # xgrammar pulls in pytorch 2.9.1, so install it manually in the runner
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
+    sed -i '/flash-attn/d' requirements/cuda.txt && \
     sed -i -E '/^(torch|torchaudio|torchvision)==/d' requirements/cuda.txt && \
     sed -i -E '/^xgrammar([<=> ].*)?$/d' requirements/common.txt && \
     pip install -r requirements/build.txt
@@ -342,7 +420,7 @@ RUN set -eux; \
           /workspace/wheels/torchvision-*.whl
 
 # =========================================================
-# STAGE 6: Runner (Transfers only necessary artifacts)
+# STAGE 7: Runner (Transfers only necessary artifacts)
 # =========================================================
 FROM nvidia/cuda:13.0.2-devel-ubuntu24.04 AS runner
 
@@ -387,6 +465,7 @@ RUN --mount=type=cache,id=tiktoken-encodings,target=/root/.cache/tiktoken_encodi
 COPY --from=pytorch-builder /workspace/wheels/. /workspace/wheels/
 COPY --from=triton-builder /workspace/wheels/. /workspace/wheels/
 COPY --from=flashinfer-builder /workspace/wheels/. /workspace/wheels/
+COPY --from=flash-attn-builder /workspace/wheels/. /workspace/wheels/
 COPY --from=vllm-builder  /workspace/wheels/. /workspace/wheels/
 
 # Install the built wheels
