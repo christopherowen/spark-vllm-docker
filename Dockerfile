@@ -148,9 +148,12 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install -r requirements/build.txt
 
 # Apply Patches
-# TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/foundation-model-stack/fastsafetensors/issues/36
-COPY fastsafetensors.patch .
-RUN patch -p1 < fastsafetensors.patch
+# fastsafetensors loading in cluster setup - tracking https://github.com/foundation-model-stack/fastsafetensors/issues/36
+RUN set -eux; \
+    patch="fastsafetensors-issue-36.patch"; \
+    echo "==> Applying $patch"; \
+    cd "$VLLM_BASE_DIR/vllm"; \
+    (patch --dry-run -p1 < "/tmp/patches/$patch" && patch -p1 < "/tmp/patches/$patch")
 
 # Install custom Triton from triton-builder (before vLLM below)
 COPY --from=triton-builder /workspace/wheels /workspace/wheels
