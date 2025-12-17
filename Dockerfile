@@ -59,6 +59,9 @@ ARG CACHEBUST_DEPS=1
 # Set pip cache directory
 ENV PIP_CACHE_DIR=/root/.cache/pip
 
+# Copy Patches
+COPY patches/ /tmp/patches/
+
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
