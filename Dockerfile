@@ -152,17 +152,17 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 COPY fastsafetensors.patch .
 RUN patch -p1 < fastsafetensors.patch
 
-# Final Compilation
+# Install custom Triton from triton-builder (before vLLM below)
+COPY --from=triton-builder /workspace/wheels /workspace/wheels
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    pip install /workspace/wheels/*.whl
+
+# vLLM Compilation
 # We mount the ccache directory here. Ideally, map this to a host volume for persistence 
 # across totally separate `docker build` invocations.
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install --no-build-isolation . -v
-
-# Install custom Triton from triton-builder
-COPY --from=triton-builder /workspace/wheels /workspace/wheels
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install /workspace/wheels/*.whl
 
 # =========================================================
 # STAGE 4: Runner (Transfers only necessary artifacts)
