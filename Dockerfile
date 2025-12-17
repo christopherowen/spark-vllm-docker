@@ -198,7 +198,63 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     rm -rf "$TRITON_VENV"
 
 # =========================================================
-# STAGE 4: vLLM Builder (Builds vLLM and dependancies wheels)
+# STAGE 4: FlashInfer Builder (Nightly wheels; force JIT for sm_121a)
+# =========================================================
+FROM base AS flashinfer-builder
+
+# Match Shaun: nightly index + cu130 JIT cache, skip flashinfer-cubin to force JIT SM121a
+ARG FLASHINFER_INDEX_BASE=https://flashinfer.ai/whl/nightly/
+ARG FLASHINFER_JIT_INDEX_CU130=https://flashinfer.ai/whl/nightly/cu130
+ARG FLASHINFER_WHEEL_KEY=nightly
+ARG FLASHINFER_CUDA_TAG=cu130
+
+WORKDIR $VLLM_BASE_DIR
+ENV FLASHINFER_VENV=${VLLM_BASE_DIR}/flashinfer/.venv-build
+ENV PATH=${FLASHINFER_VENV}/bin:$PATH
+
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    set -eux; \
+    python3 -m venv "$FLASHINFER_VENV"; \
+    pip install -U pip setuptools wheel
+
+# Download (or reuse) wheels into a persistent wheelhouse cache, then export to /workspace/wheels
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    --mount=type=cache,id=flashinfer-wheelhouse,target=/wheelhouse \
+    set -eux; \
+    \
+    # Sanity check: nvcc supports sm_121a (fail fast if CUDA toolchain can't target Spark)
+    echo '__global__ void k(){}' | nvcc -arch=sm_121a -x cu -c - -o /dev/null; \
+    \
+    WHEEL_CACHE_DIR="/wheelhouse/flashinfer/${FLASHINFER_WHEEL_KEY}/cp312/aarch64/${FLASHINFER_CUDA_TAG}"; \
+    mkdir -p "$WHEEL_CACHE_DIR" /workspace/wheels; \
+    \
+    # Cache hit check (be flexible about filenames)
+    if ls -1 "$WHEEL_CACHE_DIR"/flashinfer*python*.whl >/dev/null 2>&1 && \
+       ls -1 "$WHEEL_CACHE_DIR"/flashinfer*jit*cache*.whl >/dev/null 2>&1; then \
+      echo "==> Wheel cache hit: FlashInfer (${FLASHINFER_WHEEL_KEY}, ${FLASHINFER_CUDA_TAG})"; \
+    else \
+      echo "==> Wheel cache miss: downloading FlashInfer nightly wheels"; \
+      rm -f "$WHEEL_CACHE_DIR"/flashinfer*.whl; \
+      \
+      # flashinfer-python (nightly) - no deps
+      pip download --no-deps --pre \
+        --index-url "${FLASHINFER_INDEX_BASE}" \
+        -d "$WHEEL_CACHE_DIR" \
+        flashinfer-python; \
+      \
+      # flashinfer-jit-cache (nightly/cu130) - no deps
+      pip download --no-deps --pre \
+        --index-url "${FLASHINFER_JIT_INDEX_CU130}" \
+        -d "$WHEEL_CACHE_DIR" \
+        flashinfer-jit-cache; \
+    fi; \
+    \
+    cp -a "$WHEEL_CACHE_DIR"/*.whl /workspace/wheels/; \
+    rm -rf "$FLASHINFER_VENV"
+
+
+# =========================================================
+# STAGE 5: vLLM Builder (Builds vLLM and dependancies wheels)
 # =========================================================
 FROM base AS vllm-builder
 
@@ -236,14 +292,12 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 # Install custom PyTorch, Triton before vLLM tooling
 COPY --from=pytorch-builder /workspace/wheels/. /workspace/wheels/
 COPY --from=triton-builder  /workspace/wheels/. /workspace/wheels/
+COPY --from=flashinfer-builder /workspace/wheels/. /workspace/wheels/
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install /workspace/wheels/*.whl && rm -rf /workspace/wheels
 
 # Install additional dependencies
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    pip install flashinfer-python --no-deps --index-url https://flashinfer.ai/whl && \
-    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl && \
-    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130 && \
     pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
 
 # Prepare build requirements
@@ -288,7 +342,7 @@ RUN set -eux; \
           /workspace/wheels/torchvision-*.whl
 
 # =========================================================
-# STAGE 5: Runner (Transfers only necessary artifacts)
+# STAGE 6: Runner (Transfers only necessary artifacts)
 # =========================================================
 FROM nvidia/cuda:13.0.2-devel-ubuntu24.04 AS runner
 
@@ -332,6 +386,7 @@ RUN --mount=type=cache,id=tiktoken-encodings,target=/root/.cache/tiktoken_encodi
 # Install from wheels
 COPY --from=pytorch-builder /workspace/wheels/. /workspace/wheels/
 COPY --from=triton-builder /workspace/wheels/. /workspace/wheels/
+COPY --from=flashinfer-builder /workspace/wheels/. /workspace/wheels/
 COPY --from=vllm-builder  /workspace/wheels/. /workspace/wheels/
 
 # Install the built wheels
@@ -340,12 +395,9 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install /workspace/wheels/*.whl; \
     rm -rf /workspace/wheels
 
-# Install flashinfer and dependencies
+# Install additional runtime dependencies
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install --no-deps xgrammar fastsafetensors  && \
-    pip install flashinfer-python --no-deps --index-url https://flashinfer.ai/whl && \
-    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl && \
-    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130 && \
     pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
 
 # Setup Env for Runtime
