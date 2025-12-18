@@ -1,0 +1,89 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 2f8158d88..1a24b0645 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -215,6 +215,7 @@ if TYPE_CHECKING:
+     VLLM_HAS_FLASHINFER_CUBIN: bool = False
+     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
+     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
++    VLLM_ALLOW_SM12X_MXFP4: bool = False
+     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
+     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
+     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
+@@ -1218,6 +1219,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8": lambda: bool(
+         int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8", "0"))
+     ),
++    # If set to 1, allow SM12X (DGX Spark) to try MXFP4
++    "VLLM_ALLOW_SM12X_MXFP4": lambda: bool(
++        int(os.getenv("VLLM_ALLOW_SM12X_MXFP4", "0"))
++    ),
+     # If set to 1, use the FlashInfer CUTLASS backend for
+     # MXFP8 (activation) x MXFP4 (weight) MoE.
+     # This is separate from the TRTLLMGEN path controlled by
+diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
+index e96e87d15..dbc6622ff 100644
+--- a/vllm/model_executor/layers/quantization/mxfp4.py
++++ b/vllm/model_executor/layers/quantization/mxfp4.py
+@@ -87,13 +87,17 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
+         return Mxfp4Backend.NONE
+ 
+     # If FlashInfer is not available, try either Marlin or Triton
++    cap = current_platform.get_device_capability()
++    # DGX Spark / GB10 reports SM12.x (e.g. (12, 1)).
++    is_sm12x = cap[0] == 12 and envs.VLLM_ALLOW_SM12X_MXFP4
+     triton_kernels_supported = (
+         has_triton_kernels()
+         and is_torch_equal_or_newer("2.8.0")
+         # NOTE: triton_kernels are only confirmed to work on SM90 and SM100
+         # SM110 fails with this error: https://github.com/vllm-project/vllm/issues/29317
+-        # SM120 needs this fix: https://github.com/triton-lang/triton/pull/8498
+-        and (9, 0) <= current_platform.get_device_capability() < (11, 0)
++        # SM120/SM12x needs this fix: https://github.com/triton-lang/triton/pull/8498
++        # experimentally enabled for SM12x rather than hard-excluding.
++        and (((9, 0) <= cap < (11, 0)) or is_sm12x)
+     )
+     if envs.VLLM_MXFP4_USE_MARLIN or not triton_kernels_supported:
+         logger.info_once("[get_mxfp4_backend_with_lora] Using Marlin backend")
+@@ -110,6 +114,9 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
+         return get_mxfp4_backend_with_lora()
+ 
+     if current_platform.is_cuda():
++        cap = current_platform.get_device_capability()
++        # DGX Spark / GB10 reports SM12.x (e.g. (12, 1)).
++        is_sm12x = cap[0] == 12 and envs.VLLM_ALLOW_SM12X_MXFP4
+         if (
+             current_platform.is_device_capability(90)
+             and has_flashinfer()
+@@ -118,19 +125,19 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
+             logger.info_once("Using FlashInfer MXFP4 BF16 backend for SM90")
+             return Mxfp4Backend.SM90_FI_MXFP4_BF16
+         elif (
+-            current_platform.is_device_capability_family(100)
++            (current_platform.is_device_capability_family(100) or is_sm12x)
+             and has_flashinfer()
+             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS
+         ):
+-            logger.info_once("Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM100")
++            logger.info_once("Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM100/SM12X")
+             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
+         elif (
+-            current_platform.is_device_capability_family(100)
++            (current_platform.is_device_capability_family(100) or is_sm12x)
+             and has_flashinfer()
+             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
+         ):
+             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
+-        elif current_platform.is_device_capability_family(100) and has_flashinfer():
++        elif (current_platform.is_device_capability_family(100) or is_sm12x) and has_flashinfer():
+             logger.info_once(
+                 "Using FlashInfer MXFP4 BF16 backend for SM100, "
+                 "For faster performance on SM100, consider setting "
+@@ -141,6 +148,7 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
+         elif (
+             current_platform.is_device_capability_family(100)
+             or current_platform.is_device_capability(90)
++            or is_sm12x
+         ) and not has_flashinfer():
+             logger.warning_once(
+                 "MXFP4 MoE is enabled on Hopper/Blackwell but FlashInfer "

@@ -1,11 +1,14 @@
-# syntax=docker/dockerfile:1.6
+# syntax=docker/dockerfile:1.7
 
 ARG BUILD_JOBS=15
+ARG TORCH_CUDA_ARCH_LIST="12.0f;12.1a"
 
 # =========================================================
 # STAGE 1: Base Image (Installs Dependencies)
 # =========================================================
-FROM nvidia/cuda:13.0.2-devel-ubuntu24.04 AS base
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS base
+ARG TORCH_CUDA_ARCH_LIST
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 
 # Try to keep the system from trashing during builds
 ARG BUILD_JOBS
@@ -46,7 +49,6 @@ ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
 WORKDIR $VLLM_BASE_DIR
 
 # 2. Set Environment Variables
-ENV TORCH_CUDA_ARCH_LIST=12.1a
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 # 3. Install Python Dependencies with Cache Mounts
@@ -63,12 +65,12 @@ COPY patches/ /tmp/patches/
 # STAGE 2: PyTorch Builder (Builds wheel independently)
 # =========================================================
 FROM base AS pytorch-builder
+ARG TORCH_CUDA_ARCH_LIST
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 
 ARG PYTORCH_REPO=https://github.com/pytorch/pytorch.git
 ARG PYTORCH_REF=ffcbb7fd6109df6b65e96fe07287255e387f0123
-ARG TORCH_CUDA_ARCH_LIST_DEFAULT="12.1a"
 
-ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST_DEFAULT}"
 ENV USE_CCACHE=1
 ENV CCACHE_DIR=/root/.ccache
 
@@ -139,6 +141,8 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 # STAGE 3: Triton Builder (Builds wheel independently) - Shaun-style (LLVM21 + pinned commit)
 # =========================================================
 FROM base AS triton-builder
+ARG TORCH_CUDA_ARCH_LIST
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 
 ARG TRITON_REPO=https://github.com/triton-lang/triton.git
 # Shaun pins a newer commit (override from CLI if you want)
@@ -226,6 +230,8 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
 # STAGE 4: FlashInfer Builder (Nightly wheels; force JIT for sm_121a)
 # =========================================================
 FROM base AS flashinfer-builder
+ARG TORCH_CUDA_ARCH_LIST
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 
 # Match Shaun: nightly index + cu130 JIT cache, skip flashinfer-cubin to force JIT SM121a
 ARG FLASHINFER_INDEX_BASE=https://flashinfer.ai/whl/nightly/
@@ -267,6 +273,12 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
         -d "$WHEEL_CACHE_DIR" \
         flashinfer-python; \
       \
+      # flashinfer-cubin (nightly) - no deps
+      pip download --no-deps --pre \
+        --index-url "${FLASHINFER_INDEX_BASE}" \
+        -d "$WHEEL_CACHE_DIR" \
+        flashinfer-cubin; \
+      \
       # flashinfer-jit-cache (nightly/cu130) - no deps
       pip download --no-deps --pre \
         --index-url "${FLASHINFER_JIT_INDEX_CU130}" \
@@ -281,6 +293,8 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 # STAGE 5: FlashAttention Builder (Builds wheel for sm_121a)
 # =========================================================
 FROM base AS flash-attn-builder
+ARG TORCH_CUDA_ARCH_LIST
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 
 ARG FLASH_ATTN_REPO=https://github.com/Dao-AILab/flash-attention.git
 # Match Shaun
@@ -358,6 +372,8 @@ RUN set -eux; \
 # STAGE 6: vLLM Builder (Builds vLLM and dependancies wheels)
 # =========================================================
 FROM base AS vllm-builder
+ARG TORCH_CUDA_ARCH_LIST
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 
 # Match Shaun
 ARG VLLM_REF=ae2e503dda693b6b7ab9052ec61e012a3c730f2f
@@ -414,6 +430,13 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install -r requirements/build.txt
 
 # Apply Patches
+# Forceful mxfp4
+RUN set -eux; \
+    patch="vllm-force-mxfp4.diff"; \
+    echo "==> Applying $patch"; \
+    cd "$VLLM_BASE_DIR/vllm"; \
+    (patch --dry-run -p1 < "/tmp/patches/$patch" && patch -p1 < "/tmp/patches/$patch")
+
 # Performance boost for spark: https://github.com/vllm-project/vllm/pull/28099
 # does not change TPS for gpt-oss-120b
 RUN set -eux; \
@@ -448,7 +471,7 @@ RUN set -eux; \
 # =========================================================
 # STAGE 7: Runner (Transfers only necessary artifacts)
 # =========================================================
-FROM nvidia/cuda:13.0.2-devel-ubuntu24.04 AS runner
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS runner
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
@@ -465,8 +488,9 @@ RUN apt update && apt upgrade -y \
     libcudnn9-cuda-13 \
     libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
     libopenmpi3 libopenblas0-pthread libnuma1 \
+    # plots in vllm bench
     gnuplot-nox \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* 
 
 # Set final working directory
 WORKDIR $VLLM_BASE_DIR
@@ -503,10 +527,12 @@ RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
 # Install additional runtime dependencies
 RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
     pip install --no-deps xgrammar fastsafetensors  && \
-    pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate
+    pip install apache-tvm-ffi nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-ml-py tabulate && \
+    pip install nvidia-nvshmem-cu13
 
 # Setup Env for Runtime
-ENV TORCH_CUDA_ARCH_LIST=12.1a
+ARG TORCH_CUDA_ARCH_LIST
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH
